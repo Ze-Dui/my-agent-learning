@@ -1,0 +1,21 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Editor and OS
+.idea/
+.DS_Store
+
+# Agent runtime data
+.transcripts/
+.task_outputs/
+
+# Local scratch file
+/code1.py
