@@ -1,12 +1,15 @@
+from __future__ import annotations
+
 import os
 import re
 import subprocess
 import json
-import ast
 import yaml
 import tempfile
+import secrets
 from uuid import uuid4
 
+from dataclasses import dataclass, asdict
 from anthropic import Anthropic
 from dotenv import load_dotenv
 from pathlib import Path
@@ -19,6 +22,9 @@ client = Anthropic(
 )
 MODEL = os.getenv("MODEL_ID")
 WORKDIR = Path(__file__).resolve().parent
+
+TASKS_DIR = WORKDIR / ".tasks"
+TASK_ID_PATTERN = re.compile(r"task_[0-9a-f]{8}")
 SKILLS_DIR = WORKDIR / "skills"
 ENVIRONMENT_PROMPT = (
     "Windows: the bash tool runs through cmd.exe; use cmd.exe syntax, not Unix "
@@ -104,75 +110,6 @@ COMPACT_ACK = "Compaction requested after this tool batch."
 def run_compact() -> str:
     return COMPACT_ACK
 
-#规划工具
-class TodoManager:
-    def __init__(self):
-        self.items: list[dict] = []
-
-    def update(self, todos: list | str) -> str:
-        if isinstance(todos, str):
-            try:
-                todos = json.loads(todos)
-            except json.JSONDecodeError:
-                try:
-                    todos = ast.literal_eval(todos)
-                except (SyntaxError, ValueError) as e:
-                    raise ValueError("todos must be a list or JSON array string") from e
-
-        if not isinstance(todos, list):
-            raise ValueError("todos must be a list")
-        if len(todos) > 20:
-            raise ValueError("Max 20 todos allowed")
-
-        validated = []
-        in_progress_count = 0
-        for index, todo in enumerate(todos):
-            if not isinstance(todo, dict):
-                raise ValueError(f"todos[{index}] must be an object")
-
-            content = str(todo.get("content", "")).strip()
-            status = str(todo.get("status", "pending")).lower()
-            if not content:
-                raise ValueError(f"todos[{index}] requires content")
-            if status not in ("pending", "in_progress", "completed"):
-                raise ValueError(f"todos[{index}] has invalid status '{status}'")
-            if status == "in_progress":
-                in_progress_count += 1
-            validated.append({"content": content, "status": status})
-
-        if in_progress_count > 1:
-            raise ValueError("Only one todo can be in_progress at a time")
-
-        self.items = validated
-        return self.render()
-
-    def render(self) -> str:
-        if not self.items:
-            return "No todos."
-
-        lines = []
-        for todo in self.items:
-            marker = {
-                "pending": "[ ]",
-                "in_progress": "[>]",
-                "completed": "[x]",
-            }[todo["status"]]
-            lines.append(f"{marker} {todo['content']}")
-
-        done = sum(todo["status"] == "completed" for todo in self.items)
-        lines.append(f"\n({done}/{len(self.items)} completed)")
-        return "\n".join(lines)
-
-TODO = TodoManager()
-
-def run_todo_write(todos: list | str) -> str:
-    try:
-        output = TODO.update(todos)
-    except ValueError as e:
-        return f"Error: {e}"
-    print(f"\n\033[33m## 当前任务\033[0m\n{output}")
-    return output
-
 #skill机制
 class SkillLoader:
     def __init__(self, skills_dir: Path):
@@ -235,6 +172,15 @@ class SkillLoader:
 SKILLS_DIR = Path(__file__).resolve().parent / "skills"
 SKILL_LOADER = SkillLoader(SKILLS_DIR)
 
+
+@dataclass
+class Task:
+    id: str
+    subject: str
+    description: str
+    status: str
+    owner: str | None
+    blockedBy: list[str]
 #tool工具清单
 TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
@@ -249,8 +195,6 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
     {"name":"count_lines", "description": "Count lines of files.",
      "input_schema": {"type":"object", "properties":{"path":{"type":"string"}}, "required":["path"]}},
-    {"name":"todo_write", "description": "Create and manage a task list for your current coding session.",
-     "input_schema": {"type": "object", "properties": {"todos": {"type": "array", "maxItems": 20,"items": {"type": "object", "properties": {"content": {"type": "string", "minLength": 1},"status": {"type": "string","enum": ["pending", "in_progress","completed"]}}, "required": ["content", "status"]}}},"required": ["todos"]}},
     {"name": "load_skill","description": "Read a skill's full instructions by name.",
         "input_schema": {"type": "object","properties": {"name": {"type": "string"},},"required": ["name"],},},
     {
@@ -274,7 +218,6 @@ TOOL_HANDLERS = {
     "edit_file":run_edit,
     "glob":run_glob,
     "count_lines":run_count_lines,
-    "todo_write":run_todo_write,
     "load_skill":SKILL_LOADER.load,
     "compact":run_compact,
 }
@@ -886,6 +829,7 @@ COMPACTOR = ContextCompactor(
     model=MODEL,
 )
 
+
 #父子 Agent 的请求封装成同一个函数
 def request_model(
     messages: list,
@@ -948,12 +892,24 @@ def build_system_prompt(role_instructions: str) -> str:
     )
 
 SYSTEM = build_system_prompt(
-    "Before starting a multi-step task, use todo_write to plan your steps. "
-    "Update the task list as you progress. "
-    "Each update replaces the entire list, so include all tasks. "
-    "Keep at most one task in progress. "
+    "Use persistent task tools when work needs dependencies, "
+    "separate task records, or progress that survives sessions. "
+    "When resuming persistent work, call list_tasks and read relevant "
+    "task details with get_task before creating new tasks. "
+    "Avoid duplicating existing tasks. "
+
+    "Create task records first and wait for their returned IDs. "
+    "Then use update_task to add dependencies using those actual IDs. "
+    "Never invent task IDs. "
+    "Claim a task before executing its work. "
+    "Complete it only after its completion criteria have been met "
+    "and the results have been verified. "
+    "Being unblocked does not mean a task is already claimed or completed. "
+
     "Use task to delegate focused, self-contained subtasks, "
-    "including all necessary context in the task prompt."
+    "including all necessary context in the task prompt. "
+    "The main agent manages persistent task records. "
+    "Verify delegated results before marking a persistent task completed."
 )
 
 #子agent函数实现
@@ -1476,6 +1432,466 @@ def consolidate_memories() -> int:
         return 0
 
 
+class TaskStore:
+    def __init__(self, directory: Path):
+        self.directory = directory
+
+    def _root(self, create: bool = False) -> Path:
+        root = self.directory.resolve()
+
+        if not root.is_relative_to(WORKDIR.resolve()):
+            raise ValueError("Task store escapes the workspace")
+
+        if create:
+            root.mkdir(parents=True, exist_ok=True)
+
+        return root
+
+    def _path(self, task_id: str) -> Path:
+        if (
+            not isinstance(task_id, str)
+            or not TASK_ID_PATTERN.fullmatch(task_id)
+        ):
+            raise ValueError(f"Invalid task ID: {task_id!r}")
+
+        root = self._root()
+        path = root / f"{task_id}.json"
+
+        if path.is_symlink():
+            raise ValueError(
+                "Task files must not be symbolic links"
+            )
+
+        return path
+
+    def create(self, subject: str, description: str = "") -> Task:
+        if not isinstance(subject, str) or not subject.strip():
+            raise ValueError("Task subject must be a nonempty string")
+
+        if not isinstance(description, str):
+            raise ValueError("Task description must be a string")
+
+        self._root(create=True)
+
+        for _ in range(100):
+            task = Task(
+                id=f"task_{secrets.token_hex(4)}",
+                subject=subject.strip(),
+                description=description.strip(),
+                status="pending",
+                owner=None,
+                blockedBy=[],
+            )
+
+            try:
+                with self._path(task.id).open(
+                    "x", encoding="utf-8"
+                ) as file:
+                    json.dump(
+                        asdict(task),
+                        file,
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+
+                return task
+
+            except FileExistsError:
+                continue
+
+        raise RuntimeError("Could not allocate a unique task ID")
+
+    def load(self, task_id: str) -> Task:
+        path = self._path(task_id)
+        data = json.loads(path.read_text(encoding="utf-8"))
+
+        if not isinstance(data, dict):
+            raise ValueError("Task file must contain a JSON object")
+
+        task = Task(**data)
+
+        if task.id != task_id:
+            raise ValueError("Task file ID does not match its filename")
+
+        if task.status not in (
+            "pending", "in_progress", "completed"
+        ):
+            raise ValueError(f"Invalid task status: {task.status}")
+
+        return task
+
+
+    def save(self, task: Task) -> None:
+        self._root(create=True)
+
+        path = self._path(task.id)
+
+        path.write_text(
+            json.dumps(
+                asdict(task),
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+    def list(self) -> list[Task]:
+        root = self._root()
+
+        if not root.exists():
+            return []
+
+        tasks = []
+
+        for path in sorted(root.glob("task_*.json")):
+            task = self.load(path.stem)
+            tasks.append(task)
+
+        return tasks
+
+    def _depends_on(self, task_id: str, target_id: str) -> bool:
+        pending = [task_id]
+        visited = set()
+
+        while pending:
+            current = pending.pop()
+
+            if current == target_id:
+                return True
+
+            if current in visited:
+                continue
+
+            visited.add(current)
+            task = self.load(current)
+            pending.extend(task.blockedBy)
+
+        return False
+
+    def update_dependencies(
+        self,
+        task_id: str,
+        add_blocked_by: list[str],
+    ) -> Task:
+        if not isinstance(add_blocked_by, list):
+            raise ValueError("Dependencies must be a list of task IDs")
+
+        # 在去重之前检查元素，避免列表、字典等非法值造成错误
+        for dependency in add_blocked_by:
+            self._path(dependency)
+
+        task = self.load(task_id)
+
+        if task.status != "pending" or task.owner is not None:
+            raise ValueError(
+                "Dependencies can only be changed "
+                "while the task is pending and unowned"
+            )
+
+        dependencies = list(dict.fromkeys(add_blocked_by))
+
+        for dependency in dependencies:
+            if dependency == task_id:
+                raise ValueError("Task cannot depend on itself")
+
+            if not self._path(dependency).is_file():
+                raise ValueError(
+                    f"Dependency not found: {dependency}"
+                )
+
+            if self._depends_on(dependency, task_id):
+                raise ValueError(
+                    f"Dependency cycle detected: "
+                    f"{task_id} -> {dependency}"
+                )
+
+        task.blockedBy.extend(
+            dependency
+            for dependency in dependencies
+            if dependency not in task.blockedBy
+        )
+
+        self.save(task)
+        return task
+
+TASKS = TaskStore(TASKS_DIR)
+
+#返回某个任务依赖的任务中未完成的
+def incomplete_dependencies(task: Task) -> list[str]:
+    incomplete = []
+
+    for dependency_id in task.blockedBy:
+        try:
+            dependency = TASKS.load(dependency_id)
+        except FileNotFoundError:
+            incomplete.append(dependency_id)
+            continue
+
+        if dependency.status != "completed":
+            incomplete.append(dependency_id)
+
+    return incomplete
+
+#判断是否可以开始某个任务
+def can_start(task_id: str) -> bool:
+    task = TASKS.load(task_id)
+    return not incomplete_dependencies(task)
+
+#认领任务
+def claim_task(task_id: str, owner: str = "agent") -> str:
+    if not isinstance(owner, str) or not owner.strip():
+        raise ValueError("Owner must be a nonempty string")
+
+    owner = owner.strip()
+    task = TASKS.load(task_id)
+
+    if task.status != "pending" or task.owner is not None:
+        return f"Task {task_id} is not available to claim"
+
+    dependencies = incomplete_dependencies(task)
+
+    if dependencies:
+        return f"Blocked by: {', '.join(dependencies)}"
+
+    task.owner = owner
+    task.status = "in_progress"
+    TASKS.save(task)
+
+    return f"Claimed {task_id} ({task.subject})"
+
+#完成任务，并报告刚解锁的任务
+def complete_task(task_id: str, owner: str = "agent") -> str:
+    if not isinstance(owner, str) or not owner.strip():
+        raise ValueError("Owner must be a nonempty string")
+
+    owner = owner.strip()
+    task = TASKS.load(task_id)
+
+    if task.status != "in_progress":
+        return f"Task {task_id} is {task.status}, cannot complete"
+
+    if task.owner != owner:
+        return (
+            f"Task {task_id} is owned by {task.owner}, "
+            f"not {owner}"
+        )
+
+    ready_before = {
+        item.id
+        for item in TASKS.list()
+        if item.status == "pending"
+        and item.blockedBy
+        and can_start(item.id)
+    }
+
+    task.status = "completed"
+    TASKS.save(task)
+
+    unblocked = [
+        item
+        for item in TASKS.list()
+        if item.status == "pending"
+        and item.blockedBy
+        and item.id not in ready_before
+        and can_start(item.id)
+    ]
+
+    message = f"Completed {task_id} ({task.subject})"
+
+    if unblocked:
+        details = ", ".join(
+            f"{item.id} ({item.subject})"
+            for item in unblocked
+        )
+        message += f"\nUnblocked: {details}"
+
+    return message
+
+def run_create_task(
+    subject: str,
+    description: str = "",
+) -> str:
+    task = TASKS.create(subject, description)
+
+    return json.dumps(
+        asdict(task),
+        ensure_ascii=False,
+        indent=2,
+    )
+
+def run_update_task(
+    task_id: str,
+    addBlockedBy: list[str],
+) -> str:
+    task = TASKS.update_dependencies(
+        task_id,
+        addBlockedBy,
+    )
+
+    return json.dumps(
+        asdict(task),
+        ensure_ascii=False,
+        indent=2,
+    )
+
+#查看单个任务
+def run_get_task(task_id: str) -> str:
+    task = TASKS.load(task_id)
+
+    return json.dumps(
+        asdict(task),
+        ensure_ascii=False,
+        indent=2,
+    )
+
+def run_list_tasks() -> str:
+    tasks = TASKS.list()
+
+    if not tasks:
+        return "No tasks."
+
+    lines = []
+
+    for task in tasks:
+        incomplete = incomplete_dependencies(task)
+
+        if task.status == "pending":
+            availability = (
+                "blocked" if incomplete else "ready"
+            )
+        else:
+            availability = task.status
+
+        lines.append(
+            f"{task.id} | {task.subject} "
+            f"| status={task.status} "
+            f"| owner={task.owner or '-'} "
+            f"| availability={availability} "
+            f"| blocked_by={', '.join(incomplete) or '-'}"
+        )
+
+    return "\n".join(lines)
+
+def run_claim_task(task_id: str) -> str:
+    return claim_task(task_id, owner="agent")
+
+
+def run_complete_task(task_id: str) -> str:
+    return complete_task(task_id, owner="agent")
+
+TOOLS.extend([
+    {
+        "name": "create_task",
+        "description": (
+            "Create a persistent task. Returns its generated ID. "
+            "Create tasks first, then use update_task to add dependencies."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "subject": {
+                    "type": "string",
+                    "description": "A concise task title.",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Task details and completion criteria.",
+                },
+            },
+            "required": ["subject"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "update_task",
+        "description": (
+            "Add prerequisite task IDs to a pending, unowned task. "
+            "Rejects missing dependencies and dependency cycles."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string"},
+                "addBlockedBy": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "IDs of tasks that must complete before this task starts."
+                    ),
+                },
+            },
+            "required": ["task_id", "addBlockedBy"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "list_tasks",
+        "description": (
+            "List persistent tasks, their statuses, owners, "
+            "and unfinished dependencies."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "get_task",
+        "description": (
+            "Read the full task record, including its description "
+            "and prerequisite IDs."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string"},
+            },
+            "required": ["task_id"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "claim_task",
+        "description": (
+            "Claim a pending task for the main agent and mark it in progress. "
+            "All prerequisite tasks must be completed."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string"},
+            },
+            "required": ["task_id"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "complete_task",
+        "description": (
+            "Mark a task owned by the main agent as completed. "
+            "Call only after doing and verifying the work. "
+            "Returns any newly unblocked tasks."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string"},
+            },
+            "required": ["task_id"],
+            "additionalProperties": False,
+        },
+    },
+])
+
+TOOL_HANDLERS.update({
+    "create_task": run_create_task,
+    "update_task": run_update_task,
+    "list_tasks": run_list_tasks,
+    "get_task": run_get_task,
+    "claim_task": run_claim_task,
+    "complete_task": run_complete_task,
+})
 
 def run_subagent(prompt:str)->str:
     print("[-----现在是子agent的部分-----]")
@@ -1572,7 +1988,6 @@ TOOL_HANDLERS["task"] = run_subagent
 
 #agent循环
 def agent_loop(messages, active_request:str):
-    rounds_since_todo = 0
     count = 0
     memories = recall_memories(active_request)
     system = with_memories(base_system=SYSTEM, memories=memories)
@@ -1604,7 +2019,6 @@ def agent_loop(messages, active_request:str):
             return response.content
         #单次调用工具的结果
         results = []
-        used_todo = False
         compact_requested = False
 
         print(f"\n[agent----{count}]")
@@ -1612,9 +2026,6 @@ def agent_loop(messages, active_request:str):
 
         for block in tool_calls:
             output = execute_tool(block, TOOL_HANDLERS)
-
-            if block.name == "todo_write":
-                used_todo = True
 
             if block.name == "compact" and output == COMPACT_ACK:
                 compact_requested = True
@@ -1624,14 +2035,6 @@ def agent_loop(messages, active_request:str):
                 "tool_use_id": block.id,
                 "content": output,
             })
-
-        rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
-        if rounds_since_todo >= 3:
-            results.append({
-                "type": "text",
-                "text": "<reminder>Update your todos.</reminder>",
-            })
-            rounds_since_todo = 0
 
         results = COMPACTOR.tool_result_budget(results)
 
