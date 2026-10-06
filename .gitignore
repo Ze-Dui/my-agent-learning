@@ -19,3 +19,6 @@ __pycache__/
 
 # Local scratch file
 /code1.py
+
+# Persistent runtime memories
+.memory/
